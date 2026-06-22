@@ -99,6 +99,22 @@ app.add_middleware(
 # X-Demo-Key protection on POST/DELETE endpoints
 app.add_middleware(DemoKeyMiddleware, secret_key=settings.demo_secret_key)
 
+# --- API Routers ---
+from api.objects import router as objects_router
+from api.conjunctions import router as conjunctions_router
+from api.maneuvers import router as maneuvers_router
+from api.simulation import router as simulation_router
+
+app.include_router(objects_router)
+app.include_router(conjunctions_router)
+app.include_router(maneuvers_router)
+app.include_router(simulation_router)
+
+# --- WebSocket ---
+from ws.live import websocket_endpoint
+
+app.websocket("/ws/live")(websocket_endpoint)
+
 
 @app.get("/api/health")
 async def health_check():
