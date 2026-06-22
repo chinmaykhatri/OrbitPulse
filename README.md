@@ -1,80 +1,216 @@
-# 🛰️ OrbitPulse
+# OrbitPulse
 
-**Autonomous Space Traffic Decision Engine** — real orbital data, real physics, real collision predictions.
+**Autonomous Space Traffic Decision Engine**
 
-OrbitPulse is a production-grade system that ingests live satellite catalog data from CelesTrak, propagates 25,000+ orbits using SGP4, detects conjunction threats with two-pass screening, plans collision avoidance maneuvers, and runs agent-to-agent operator negotiations — all visualized on a real-time 3D globe command center.
+Real orbital data. Real physics. Real collision predictions.
+
+OrbitPulse ingests the full CelesTrak catalog (~25,000 tracked objects), propagates orbits with SGP4 over a 72-hour window, detects conjunctions using two-pass screening, scores risk, plans avoidance maneuvers, runs game-theoretic negotiation between operators, and simulates fragmentation events — all in a single application.
 
 ---
-
-## What It Does
-
-| Capability | How It Works |
-|---|---|
-| **Live Orbital Data** | Ingests TLE data from CelesTrak (same source the satellite industry uses) |
-| **SGP4 Propagation** | NORAD-standard orbital mechanics, vectorized across 25,000+ objects |
-| **Conjunction Detection** | Two-pass screening: 60s coarse → 1s fine, with altitude band pre-filter |
-| **Risk Scoring** | Weighted formula: proximity (50%), velocity (30%), size (20%), trend multiplier |
-| **Triage Funnel** | ACTION / WATCHLIST / DISMISSED — deterministic tier assignment |
-| **Maneuver Planning** | Tsiolkovsky-based delta-v burns with fuel cost and mission life impact |
-| **Operator Negotiation** | Game-theoretic utility functions for both-maneuverable conjunction resolution |
-| **Fragmentation Simulation** | Kessler syndrome visualization with NASA breakup model velocity distributions |
-| **ISS Validation** | Self-validating position against TLE epoch — cross-check with n2yo.com |
-| **SOCRATES Cross-Check** | Live comparison against CelesTrak's independent conjunction predictions |
 
 ## Architecture
 
 ```
-CelesTrak → Ingestion → SGP4 Engine → Two-Pass Detector → Triage Funnel
-                                                              ↓
-                                              Maneuver Planner ← Satellite Profiles
-                                                              ↓
-                                              Negotiation Protocol (both-maneuverable)
-                                                              ↓
-Frontend ← WebSocket ← API ← Decision Pipeline ← Fragmentation Simulator
+┌──────────────┐    ┌───────────────┐    ┌─────────────┐
+│  CelesTrak   │───▶│   Ingestion   │───▶│  PostgreSQL  │
+│  (TLE/GP)    │    │   Pipeline    │    │  (6 tables)  │
+└──────────────┘    └───────┬───────┘    └──────┬──────┘
+                            │                    │
+                    ┌───────▼───────┐    ┌───────▼──────┐
+                    │  SGP4 Engine  │───▶│    Redis      │
+                    │  (NumPy vec)  │    │ (pos arrays)  │
+                    └───────┬───────┘    └──────┬───────┘
+                            │                    │
+                    ┌───────▼───────┐            │
+                    │  2-Pass       │◀───────────┘
+                    │  Detector     │
+                    └───────┬───────┘
+                            │
+              ┌─────────────┼──────────────┐
+              │             │              │
+      ┌───────▼──────┐ ┌───▼────┐ ┌───────▼───────┐
+      │  Maneuver    │ │ Triage │ │ Fragmentation  │
+      │  Planner     │ │ Funnel │ │ Simulator      │
+      └───────┬──────┘ └────────┘ └────────────────┘
+              │
+      ┌───────▼───────┐
+      │  Negotiation  │
+      │  Protocol     │
+      └───────────────┘
 ```
 
-**Backend**: FastAPI (Python 3.12) — SGP4 orbital engine, conjunction detector, maneuver planner  
-**Frontend**: Next.js 14 + CesiumJS — live 3D globe command center  
-**Database**: PostgreSQL (Neon) — satellite catalog, conjunctions, maneuvers, negotiations  
-**Cache**: Redis — position arrays, simulation locks, pipeline status  
-**AI**: Claude API — natural language narration with deterministic template fallback  
+## Features
+
+### Orbital Engine
+- **SGP4 propagation** with WGS72 model and IAU GMST geodetic conversion
+- **Full catalog propagation**: 25,000 objects × 4,320 timesteps (72h at 60s intervals)
+- **ISS validation**: Self-checks altitude range (380–440 km) against TLE epoch
+- **Redis batch storage**: NumPy binary blobs via pipelined SET operations
+
+### Conjunction Detection
+- **Altitude band pre-filter**: 50 km bins eliminate ~95% of pairs before propagation
+- **Two-pass screening**: Coarse (60s steps, 20 km threshold) → Fine (1s steps, 10 km threshold)
+- **Risk scoring**: Weighted formula (distance 50%, velocity 30%, size 20%) with convergence trend multiplier (±30%)
+- **Three-tier triage**: ACTION / WATCHLIST / DISMISSED with hard-override rules
+
+### Maneuver Planning
+- **Tsiolkovsky rocket equation** for realistic fuel cost calculation
+- **5 candidate burns** at configurable Δv steps (0.05–1.0 m/s)
+- **Mission life impact**: fuel percentage of remaining mission budget
+- **Scoped re-screening**: verify each maneuver doesn't create new conjunctions
+
+### Negotiation Protocol
+- **Game-theoretic utility function**: weighted (fuel 40%, mission 30%, priority 30%)
+- **Multi-round protocol** with structured proposals and responses
+- **SHA-256 contract hashing** for audit trail integrity
+- **Fallback**: lower-priority satellite maneuvers if negotiation fails
+
+### Fragmentation Simulation
+- **NASA Standard Breakup Model**: log-normal velocity distribution (σ=0.4)
+- **Uniform spherical direction sampling** for debris cloud
+- **Redis simulation lock**: prevents concurrent breakup simulations
+- **Auto-expiry**: fragments cleaned up after 60 minutes
+
+### SOCRATES Validation
+- Cross-validates predictions against CelesTrak's SOCRATES (Satellite Orbital Conjunction Reports)
+- Delta-km computation for each matched conjunction pair
+- Confidence dashboard showing prediction accuracy
+
+### Frontend Command Center
+- **Interactive 3D globe**: Canvas2D orbital renderer (5,000+ satellites at 60fps)
+- **Triage funnel**: clickable 3-tier filter with proportional bars
+- **Alert cards**: tier-colored with convergence trend indicators
+- **72h Risk Timeline**: Recharts bar chart colored by triage tier
+- **Maneuver trade-off matrix**: data table with AI recommendation
+- **Negotiation viewer**: round-by-round display with contract hash
+- **Fragmentation trigger**: slider + NASA model simulation
+- **Real-time WebSocket**: position updates, pipeline status, conjunction alerts
+
+---
 
 ## Quick Start
 
+### Prerequisites
+- Docker & Docker Compose
+- Node.js 20+ (for frontend development)
+- Python 3.11+ (for backend development)
+
+### One-command launch
 ```bash
-# Start infrastructure (Postgres + Redis)
-docker-compose up -d db redis
+docker compose up --build
+```
 
-# Backend
+This starts:
+- **PostgreSQL** on port 5432
+- **Redis** on port 6379
+- **Backend** (FastAPI) on port 8000
+- **Frontend** (Next.js) on port 3000
+
+Open http://localhost:3000 — the pipeline loading screen will show while CelesTrak data is ingested and orbits are propagated (60–120 seconds on first run).
+
+### Development mode
+
+**Backend:**
+```bash
 cd backend
-cp .env.example .env
+python -m venv venv
+source venv/bin/activate  # or venv\Scripts\activate on Windows
 pip install -r requirements.txt
-alembic upgrade head
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
 
-# Frontend
+**Frontend:**
+```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-> **Note**: `--workers 1` is required. The orbital engine maintains in-memory state (position matrices) that must be consistent within a single process.
+### Environment Variables
 
-## What Is Real and What Is Simulated
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABASE_URL` | `postgresql+asyncpg://...localhost/orbitpulse` | Async PostgreSQL connection |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis for position cache |
+| `CLAUDE_API_KEY` | (empty) | Anthropic API key for AI explanations |
+| `DEMO_SECRET_KEY` | `orbitpulse-demo-2026` | X-Demo-Key header value |
+| `CORS_ORIGINS` | `http://localhost:3000` | Allowed CORS origins |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Backend API URL |
+| `NEXT_PUBLIC_WS_URL` | `ws://localhost:8000` | WebSocket URL |
 
-**Real and verifiable**: every object, every orbit, every position, every conjunction prediction. Same data source the industry uses, cross-checkable against independent trackers.
+---
 
-**Simulated and disclosed**: maneuver execution, operator fuel profiles, fragmentation clouds. The math is real. The execution is simulated.
+## API Endpoints
 
-**Demo mode**: labeled with a visible badge. Seeded ACTION-tier conjunctions ensure the demo always has interesting data. SOCRATES validation is live. ISS verification is self-validating.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/health` | Pipeline readiness + object count |
+| GET | `/api/iss` | ISS position with validation |
+| GET | `/api/positions` | All satellite positions (WebSocket recommended) |
+| GET | `/api/conjunctions` | Conjunction list (filterable by tier) |
+| GET | `/api/conjunctions/{id}` | Conjunction detail with object metadata |
+| GET | `/api/funnel` | Triage funnel statistics |
+| GET | `/api/timeline/{norad_id}` | 72h risk timeline for satellite |
+| POST | `/api/maneuvers/{conj_id}` | Generate maneuver trade-off matrix |
+| POST | `/api/negotiate/{conj_id}` | Run negotiation protocol |
+| POST | `/api/simulate/fragment/{norad_id}` | Trigger fragmentation simulation |
+| GET | `/api/socrates` | SOCRATES cross-validation |
+| GET | `/api/pipeline/status` | Detailed pipeline stage info |
+| WS | `/ws/live` | Real-time positions + alerts |
+
+---
 
 ## Tech Stack
 
-- Python 3.12, FastAPI, SQLAlchemy, Alembic, SGP4, Skyfield, NumPy, SciPy
-- Next.js 14, TypeScript, CesiumJS (resium), Recharts
-- PostgreSQL, Redis, Docker Compose
-- Claude API (Anthropic) for natural language narration
-- Deployed on Railway (backend) + Vercel (frontend) + Neon (database)
+| Layer | Technology |
+|-------|-----------|
+| **Backend** | Python 3.11, FastAPI, SQLAlchemy 2.0, asyncpg |
+| **Orbital Mechanics** | sgp4 2.23, NumPy (vectorized), IAU GMST |
+| **Database** | PostgreSQL 16 (6 tables, Alembic migrations) |
+| **Cache** | Redis 7 (NumPy binary blobs, pipeline locks) |
+| **Scheduler** | APScheduler (6-hour re-ingestion cycle) |
+| **Frontend** | Next.js 16, TypeScript, Recharts, Canvas2D |
+| **Real-time** | WebSocket (native FastAPI, exponential backoff reconnect) |
+| **Deployment** | Docker Compose, Railway-ready |
+
+---
+
+## Project Structure
+
+```
+orbitpulse2/
+├── backend/
+│   ├── api/              # FastAPI routers (5 modules)
+│   ├── core/             # Physics engines (8 modules)
+│   │   ├── propagator.py     # SGP4 wrapper
+│   │   ├── engine.py         # Full catalog propagation
+│   │   ├── detector.py       # Two-pass conjunction screening
+│   │   ├── risk_scoring.py   # Weighted risk + triage
+│   │   ├── maneuver_planner.py   # Tsiolkovsky + burn sim
+│   │   ├── negotiation.py    # Game-theoretic protocol
+│   │   ├── fragmentation.py  # NASA breakup model
+│   │   └── socrates.py       # SOCRATES validation
+│   ├── ingestion/        # CelesTrak data pipeline
+│   ├── db/               # SQLAlchemy models + session
+│   ├── cache/            # Redis position cache
+│   ├── schemas/          # Pydantic request/response models
+│   ├── middleware/        # X-Demo-Key protection
+│   ├── ws/               # WebSocket handler
+│   ├── tests/            # pytest test suite
+│   ├── alembic/          # Database migrations
+│   └── main.py           # FastAPI app + startup pipeline
+├── frontend/
+│   └── src/
+│       ├── app/          # Next.js App Router
+│       ├── components/   # 11 React components
+│       ├── hooks/        # WebSocket + polling hooks
+│       ├── lib/          # Typed API client
+│       └── types/        # TypeScript type definitions
+├── docker-compose.yml
+└── README.md
+```
+
+---
 
 ## License
 

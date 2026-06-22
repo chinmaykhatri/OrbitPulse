@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   db:
     image: postgres:16-alpine
@@ -35,6 +33,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/orbitpulse
       REDIS_URL: redis://redis:6379/0
       CORS_ORIGINS: http://localhost:3000
+      DEMO_SECRET_KEY: orbitpulse-demo-2026
     depends_on:
       db:
         condition: service_healthy
@@ -42,6 +41,19 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_WS_URL: ws://localhost:8000
+      NEXT_PUBLIC_DEMO_KEY: orbitpulse-demo-2026
+    depends_on:
+      - backend
+    restart: unless-stopped
 
 volumes:
   pgdata:
