@@ -8,6 +8,7 @@ from sqlalchemy import select, func, desc
 from db.session import AsyncSessionLocal
 from db.models import Conjunction, SpaceObject, TriageTier
 from schemas.conjunctions import ConjunctionBase, ConjunctionDetail, FunnelStats, TimelineEvent
+from core.probability_of_collision import compute_pc_for_conjunction
 
 logger = logging.getLogger("orbitpulse.api.conjunctions")
 router = APIRouter(prefix="/api", tags=["Conjunctions"])
@@ -206,3 +207,23 @@ async def get_risk_timeline(
         )
         for c in conjunctions
     ]
+
+
+@router.get("/conjunctions/{conjunction_id}/pc")
+async def get_probability_of_collision(
+    conjunction_id: int = Path(..., ge=1),
+):
+    """Compute Probability of Collision using Chan's 2008 analytical method.
+
+    Returns Pc value, B-plane miss vector, projected covariance eigenvalues,
+    TLE epoch ages, and combined hard-body radius. Covariance is estimated
+    from TLE epoch age when owner/operator data is unavailable.
+
+    NASA CARA action threshold: Pc > 1e-4 (1 in 10,000).
+    ESA action threshold: Pc > 1e-4 for LEO, 1e-5 for GEO.
+    """
+    result = await compute_pc_for_conjunction(conjunction_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Conjunction {conjunction_id} not found or Pc computation failed")
+    return result
+

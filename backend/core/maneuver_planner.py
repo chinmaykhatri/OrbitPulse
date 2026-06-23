@@ -110,6 +110,248 @@ def compute_mission_life_impact(
     )
 
 
+
+# Earth gravitational parameter (km³/s²) — WGS84
+MU_EARTH = 398600.4418
+
+
+def _state_to_orbital_elements(
+    pos: np.ndarray,
+    vel: np.ndarray,
+) -> tuple[float, float, float, float, float, float]:
+    """Convert Cartesian state vector to classical Keplerian orbital elements.
+
+    Args:
+        pos: Position vector in km (TEME frame)
+        vel: Velocity vector in km/s (TEME frame)
+
+    Returns:
+        Tuple of (a, e, i, raan, argp, true_anomaly) where:
+          a = semi-major axis (km)
+          e = eccentricity (dimensionless)
+          i = inclination (rad)
+          raan = right ascension of ascending node (rad)
+          argp = argument of periapsis (rad)
+          true_anomaly = true anomaly (rad)
+    """
+    r = np.linalg.norm(pos)
+    v = np.linalg.norm(vel)
+
+    # Specific angular momentum
+    h_vec = np.cross(pos, vel)
+    h = np.linalg.norm(h_vec)
+
+    # Node vector
+    k_hat = np.array([0.0, 0.0, 1.0])
+    n_vec = np.cross(k_hat, h_vec)
+    n = np.linalg.norm(n_vec)
+
+    # Eccentricity vector
+    e_vec = ((v**2 - MU_EARTH / r) * pos - np.dot(pos, vel) * vel) / MU_EARTH
+    e = np.linalg.norm(e_vec)
+
+    # Specific mechanical energy → semi-major axis
+    energy = v**2 / 2.0 - MU_EARTH / r
+    if abs(energy) < 1e-10:
+        a = float("inf")  # Parabolic — shouldn't happen for orbiting objects
+    else:
+        a = -MU_EARTH / (2.0 * energy)
+
+    # Inclination
+    i = math.acos(np.clip(h_vec[2] / h, -1.0, 1.0))
+
+    # RAAN
+    if n > 1e-10:
+        raan = math.acos(np.clip(n_vec[0] / n, -1.0, 1.0))
+        if n_vec[1] < 0:
+            raan = 2 * math.pi - raan
+    else:
+        raan = 0.0
+
+    # Argument of periapsis
+    if n > 1e-10 and e > 1e-10:
+        argp = math.acos(np.clip(np.dot(n_vec, e_vec) / (n * e), -1.0, 1.0))
+        if e_vec[2] < 0:
+            argp = 2 * math.pi - argp
+    else:
+        argp = 0.0
+
+    # True anomaly
+    if e > 1e-10:
+        nu = math.acos(np.clip(np.dot(e_vec, pos) / (e * r), -1.0, 1.0))
+        if np.dot(pos, vel) < 0:
+            nu = 2 * math.pi - nu
+    else:
+        nu = 0.0
+
+    return (a, e, i, raan, argp, nu)
+
+
+def _solve_kepler(M: float, e: float, tol: float = 1e-12, max_iter: int = 50) -> float:
+    """Solve Kepler's equation M = E - e·sin(E) for eccentric anomaly E.
+
+    Uses Newton-Raphson iteration with Markley's starting value.
+    Converges in 3-5 iterations for LEO eccentricities.
+
+    Args:
+        M: Mean anomaly (rad), reduced to [0, 2π)
+        e: Eccentricity (0 ≤ e < 1)
+        tol: Convergence tolerance (rad)
+        max_iter: Maximum iterations
+
+    Returns:
+        Eccentric anomaly E (rad)
+    """
+    M = M % (2 * math.pi)
+    if M > math.pi:
+        M -= 2 * math.pi
+
+    # Starting guess: Markley's rational approximation
+    E = M + e * math.sin(M) / (1 - math.sin(M + e) + math.sin(M))
+
+    for _ in range(max_iter):
+        f = E - e * math.sin(E) - M
+        f_prime = 1 - e * math.cos(E)
+        delta = f / f_prime
+        E -= delta
+        if abs(delta) < tol:
+            break
+
+    return E % (2 * math.pi)
+
+
+def _orbital_elements_to_state(
+    a: float,
+    e: float,
+    i: float,
+    raan: float,
+    argp: float,
+    nu: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert Keplerian orbital elements back to Cartesian state vector.
+
+    Args:
+        a: Semi-major axis (km)
+        e: Eccentricity
+        i: Inclination (rad)
+        raan: Right ascension of ascending node (rad)
+        argp: Argument of periapsis (rad)
+        nu: True anomaly (rad)
+
+    Returns:
+        (position_km, velocity_km_s) — both as 3D numpy arrays in TEME frame
+    """
+    p = a * (1 - e**2)  # Semi-latus rectum
+    r = p / (1 + e * math.cos(nu))
+
+    # Position and velocity in the perifocal frame (PQW)
+    pos_pqw = np.array([
+        r * math.cos(nu),
+        r * math.sin(nu),
+        0.0,
+    ])
+
+    vel_pqw = math.sqrt(MU_EARTH / p) * np.array([
+        -math.sin(nu),
+        e + math.cos(nu),
+        0.0,
+    ])
+
+    # Rotation matrix: perifocal (PQW) → inertial (TEME)
+    cos_raan = math.cos(raan)
+    sin_raan = math.sin(raan)
+    cos_argp = math.cos(argp)
+    sin_argp = math.sin(argp)
+    cos_i = math.cos(i)
+    sin_i = math.sin(i)
+
+    R = np.array([
+        [
+            cos_raan * cos_argp - sin_raan * sin_argp * cos_i,
+            -cos_raan * sin_argp - sin_raan * cos_argp * cos_i,
+            sin_raan * sin_i,
+        ],
+        [
+            sin_raan * cos_argp + cos_raan * sin_argp * cos_i,
+            -sin_raan * sin_argp + cos_raan * cos_argp * cos_i,
+            -cos_raan * sin_i,
+        ],
+        [
+            sin_argp * sin_i,
+            cos_argp * sin_i,
+            cos_i,
+        ],
+    ])
+
+    pos = R @ pos_pqw
+    vel = R @ vel_pqw
+
+    return pos, vel
+
+
+def _keplerian_propagate(
+    pos: np.ndarray,
+    vel: np.ndarray,
+    dt_seconds: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Propagate a state vector forward in time using two-body Keplerian mechanics.
+
+    This is the CORRECT way to propagate a modified orbit after applying
+    a delta-v. It follows the curved orbital path instead of a straight line.
+
+    Steps:
+      1. Convert (pos, vel) → orbital elements (a, e, i, Ω, ω, ν)
+      2. Convert true anomaly → eccentric anomaly → mean anomaly
+      3. Advance mean anomaly by n·Δt (where n = √(μ/a³))
+      4. Solve Kepler's equation for new eccentric anomaly
+      5. Convert back to true anomaly → state vector
+
+    Accuracy: Exact for two-body motion. For LEO with J2 perturbations,
+    error is ~0.1-1 km over 2 hours, which is sufficient for maneuver
+    candidate ranking (we're comparing candidates, not generating guidance).
+
+    Args:
+        pos: Position vector (km, TEME)
+        vel: Velocity vector (km/s, TEME)
+        dt_seconds: Time to propagate forward (seconds)
+
+    Returns:
+        (new_pos_km, new_vel_km_s) after dt_seconds
+    """
+    a, e, i, raan, argp, nu = _state_to_orbital_elements(pos, vel)
+
+    if a <= 0 or a == float("inf") or e >= 1.0:
+        # Hyperbolic or parabolic — fall back to linear (shouldn't happen)
+        return pos + vel * dt_seconds, vel
+
+    # True anomaly → eccentric anomaly
+    E0 = 2 * math.atan2(
+        math.sqrt(1 - e) * math.sin(nu / 2),
+        math.sqrt(1 + e) * math.cos(nu / 2),
+    )
+
+    # Eccentric anomaly → mean anomaly
+    M0 = E0 - e * math.sin(E0)
+
+    # Mean motion (rad/s)
+    n = math.sqrt(MU_EARTH / a**3)
+
+    # Advance mean anomaly
+    M1 = M0 + n * dt_seconds
+
+    # Solve Kepler's equation for new eccentric anomaly
+    E1 = _solve_kepler(M1, e)
+
+    # Eccentric anomaly → true anomaly
+    nu1 = 2 * math.atan2(
+        math.sqrt(1 + e) * math.sin(E1 / 2),
+        math.sqrt(1 - e) * math.cos(E1 / 2),
+    )
+
+    # Convert back to state vector
+    return _orbital_elements_to_state(a, e, i, raan, argp, nu1)
+
+
 async def _simulate_burn_miss_distance(
     line1: str,
     line2: str,
@@ -122,14 +364,13 @@ async def _simulate_burn_miss_distance(
 ) -> float | None:
     """Simulate a burn and compute the resulting miss distance.
 
-    Modifies the satellite's velocity at burn_time by delta_v in the
-    specified direction, then propagates both objects to the original TCA
-    to find the new miss distance.
+    Applies delta-v to the satellite's velocity at burn_time, then
+    propagates the modified orbit to TCA using Keplerian mechanics
+    (not linear extrapolation). The other object is propagated with
+    SGP4 from its TLE.
 
-    This is an approximation because we modify the velocity directly
-    without re-fitting a new TLE. For small burns (<1 m/s), this is
-    accurate to within a few percent. For larger burns, the approximation
-    degrades but is still useful for comparative ranking.
+    Accuracy: ~0.1-1 km for burns < 1 m/s with 2h lead time.
+    Sufficient for ranking maneuver candidates against each other.
 
     Returns None if propagation fails.
     """
@@ -146,16 +387,11 @@ async def _simulate_burn_miss_distance(
         delta_v_kms = delta_v_ms / 1000.0
         modified_vel = vel_burn + vel_unit * delta_v_kms
 
-        # For the post-burn position at TCA, we use a linear approximation
-        # because we can't re-fit a TLE from a single state vector.
-        # This is valid for small delta-v and short time intervals.
+        # Propagate modified orbit to TCA using Keplerian mechanics
         dt_seconds = (tca_time - burn_time).total_seconds()
+        pos_at_tca, _ = _keplerian_propagate(pos_burn, modified_vel, dt_seconds)
 
-        # Post-burn position at TCA (linear extrapolation from modified velocity)
-        # This is first-order accurate — sufficient for ranking candidates
-        pos_at_tca = pos_burn + modified_vel * dt_seconds
-
-        # Other object's position at TCA (unmodified orbit)
+        # Other object's position at TCA (unmodified orbit via SGP4)
         pos_other, _ = propagate_single(other_line1, other_line2, tca_time)
 
         miss_km = float(np.linalg.norm(pos_at_tca - pos_other))
@@ -164,6 +400,7 @@ async def _simulate_burn_miss_distance(
     except (PropagationError, Exception) as e:
         logger.debug(f"Burn simulation failed: {e}")
         return None
+
 
 
 async def _count_secondary_conjunctions(
@@ -209,11 +446,10 @@ async def _count_secondary_conjunctions(
         check_offsets_h = [6, 24, 48]
 
         for offset_h in check_offsets_h:
-            check_time = burn_time + timedelta(hours=offset_h)
             dt_s = offset_h * 3600.0
 
-            # Linear approximation of modified position at check time
-            modified_pos = pos_burn + modified_vel * dt_s
+            # Keplerian propagation of modified orbit (curves correctly)
+            modified_pos, _ = _keplerian_propagate(pos_burn, modified_vel, dt_s)
 
             # Get catalog positions at this time (use the engine's batch method)
             from core.engine import orbital_engine

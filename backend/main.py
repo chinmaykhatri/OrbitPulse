@@ -188,12 +188,14 @@ from api.conjunctions import router as conjunctions_router
 from api.maneuvers import router as maneuvers_router
 from api.simulation import router as simulation_router
 from api.validation import router as validation_router
+from api.export import router as export_router
 
 app.include_router(objects_router)
 app.include_router(conjunctions_router)
 app.include_router(maneuvers_router)
 app.include_router(simulation_router)
 app.include_router(validation_router)
+app.include_router(export_router)
 
 # --- WebSocket ---
 from ws.live import websocket_endpoint
