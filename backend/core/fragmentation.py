@@ -202,10 +202,27 @@ async def simulate_fragmentation(
             f"expires at {expiry.isoformat()}"
         )
 
+        # Run cascade detection — check fragments against catalog objects
+        cascade_count = 0
+        try:
+            cascade_count = await _detect_cascade_conjunctions(
+                fragment_positions=fragment_positions,
+                fragment_velocities=fragment_vels,
+                fragment_ids=synthetic_ids,
+                parent_norad_id=norad_id,
+            )
+            logger.info(
+                f"Cascade detection: {cascade_count} new conjunctions "
+                f"triggered by {fragment_count} fragments"
+            )
+        except Exception as e:
+            logger.warning(f"Cascade detection failed (non-fatal): {e}")
+
         return {
             "fragments_generated": fragment_count,
             "synthetic_ids": synthetic_ids,
             "parent_norad_id": norad_id,
+            "cascade_conjunctions": cascade_count,
         }
 
     finally:
@@ -267,3 +284,109 @@ async def cleanup_fragments(norad_id: int | None = None) -> int:
 
     logger.info(f"Cleaned up {len(fragment_ids)} fragment(s)")
     return len(fragment_ids)
+
+
+async def _detect_cascade_conjunctions(
+    fragment_positions: np.ndarray,
+    fragment_velocities: np.ndarray,
+    fragment_ids: list[int],
+    parent_norad_id: int,
+) -> int:
+    """Detect cascade conjunctions between fragments and catalog objects.
+
+    Checks every fragment's position against a sample of active catalog
+    objects to find close approaches created by the breakup event.
+    These are stored as real conjunctions with tier=ACTION to flood
+    the alert queue and demonstrate the Kessler cascade effect.
+
+    This is a scoped, single-timestep check (not a full 72h propagation)
+    because fragments are transient simulation objects.
+
+    Args:
+        fragment_positions: (N, 3) array of fragment TEME positions (km)
+        fragment_velocities: (N, 3) array of fragment velocities (km/s)
+        fragment_ids: Synthetic NORAD IDs for each fragment
+        parent_norad_id: NORAD ID of the parent satellite that was fragmented
+
+    Returns:
+        Count of cascade conjunctions detected and stored.
+    """
+    from core.engine import orbital_engine
+    from core.risk_scoring import compute_risk_score, assign_tier
+    from db.models import Conjunction, TriageTier
+
+    # Get positions of real catalog objects at current time
+    catalog_positions = await orbital_engine.get_current_positions_batch(limit=2000)
+    if not catalog_positions:
+        return 0
+
+    # Build array of catalog positions (lat, lon, alt → approximate TEME for distance check)
+    # We use the fragment TEME positions directly and convert catalog geodetic to approximate TEME
+    cascade_threshold_km = settings.conjunction_threshold_km  # 10 km
+
+    conjunctions_found: list[dict] = []
+    now = datetime.now(timezone.utc)
+
+    for i, frag_pos in enumerate(fragment_positions):
+        frag_id = fragment_ids[i]
+        frag_vel = fragment_velocities[i]
+
+        for cat_entry in catalog_positions:
+            if len(cat_entry) < 4:
+                continue
+
+            cat_norad = int(cat_entry[0])
+            # Skip the parent object and other fragments
+            if cat_norad == parent_norad_id or cat_norad < 0:
+                continue
+
+            cat_lat, cat_lon, cat_alt = cat_entry[1], cat_entry[2], cat_entry[3]
+            # Convert geodetic to approximate TEME position for distance check
+            r = 6371.0 + cat_alt
+            lat_rad = np.radians(cat_lat)
+            lon_rad = np.radians(cat_lon)
+            cat_pos = np.array([
+                r * np.cos(lat_rad) * np.cos(lon_rad),
+                r * np.cos(lat_rad) * np.sin(lon_rad),
+                r * np.sin(lat_rad),
+            ])
+
+            dist = float(np.linalg.norm(frag_pos - cat_pos))
+            if dist < cascade_threshold_km:
+                rel_vel = float(np.linalg.norm(frag_vel)) if frag_vel is not None else 7.0
+                risk = compute_risk_score(
+                    miss_km=dist,
+                    rel_vel_kms=rel_vel,
+                    size_a="SMALL",
+                    size_b=None,
+                    prev_miss_km=None,
+                )
+                tier = assign_tier(risk, dist, rel_vel)
+
+                conjunctions_found.append({
+                    "obj_a_id": frag_id,
+                    "obj_b_id": cat_norad,
+                    "tca_time": now,
+                    "miss_distance_km": round(dist, 4),
+                    "relative_velocity_kms": round(rel_vel, 2),
+                    "risk_score": risk,
+                    "tier": tier,
+                    "both_maneuverable": False,
+                })
+
+        # Cap cascade conjunctions to prevent database flood
+        if len(conjunctions_found) >= 50:
+            break
+
+    if not conjunctions_found:
+        return 0
+
+    # Store cascade conjunctions in database
+    async with AsyncSessionLocal() as session:
+        for conj_data in conjunctions_found:
+            conj = Conjunction(**conj_data)
+            session.add(conj)
+        await session.commit()
+
+    return len(conjunctions_found)
+

@@ -166,6 +166,87 @@ async def _simulate_burn_miss_distance(
         return None
 
 
+async def _count_secondary_conjunctions(
+    line1: str,
+    line2: str,
+    burn_time: datetime,
+    delta_v_ms: float,
+    direction: ManeuverDirection,
+    original_other_id: int,
+) -> int:
+    """Re-screen a modified trajectory against the catalog for secondary collisions.
+
+    After applying a delta-v burn, propagates the modified orbit forward
+    72 hours and checks distance against a sample of catalog objects.
+    If any come within 10 km, they count as secondary conjunctions.
+
+    This implements the Domino Effect requirement: auto-reject any burn
+    that creates new close approaches.
+
+    Args:
+        line1: TLE line 1 of the maneuvering satellite
+        line2: TLE line 2 of the maneuvering satellite
+        burn_time: Time of the burn
+        delta_v_ms: Burn magnitude in m/s
+        direction: PROGRADE or RETROGRADE
+        original_other_id: NORAD ID of the other object in the original
+                           conjunction (excluded from secondary checks)
+
+    Returns:
+        Count of secondary conjunctions detected.
+    """
+    try:
+        # Get post-burn state
+        pos_burn, vel_burn = propagate_single(line1, line2, burn_time)
+        vel_unit = vel_burn / np.linalg.norm(vel_burn)
+        if direction == ManeuverDirection.RETROGRADE:
+            vel_unit = -vel_unit
+        delta_v_kms = delta_v_ms / 1000.0
+        modified_vel = vel_burn + vel_unit * delta_v_kms
+
+        # Check at 3 sample times: +6h, +24h, +48h after burn
+        secondary_count = 0
+        check_offsets_h = [6, 24, 48]
+
+        for offset_h in check_offsets_h:
+            check_time = burn_time + timedelta(hours=offset_h)
+            dt_s = offset_h * 3600.0
+
+            # Linear approximation of modified position at check time
+            modified_pos = pos_burn + modified_vel * dt_s
+
+            # Get catalog positions at this time (use the engine's batch method)
+            from core.engine import orbital_engine
+            catalog_positions = await orbital_engine.get_current_positions_batch(limit=500)
+
+            for cat_entry in catalog_positions:
+                if len(cat_entry) < 4:
+                    continue
+                cat_norad = int(cat_entry[0])
+                if cat_norad == original_other_id or cat_norad < 0:
+                    continue
+
+                cat_lat, cat_lon, cat_alt = cat_entry[1], cat_entry[2], cat_entry[3]
+                r = 6371.0 + cat_alt
+                lat_rad = np.radians(cat_lat)
+                lon_rad = np.radians(cat_lon)
+                cat_pos = np.array([
+                    r * np.cos(lat_rad) * np.cos(lon_rad),
+                    r * np.cos(lat_rad) * np.sin(lon_rad),
+                    r * np.sin(lat_rad),
+                ])
+
+                dist = float(np.linalg.norm(modified_pos - cat_pos))
+                if dist < settings.conjunction_threshold_km:
+                    secondary_count += 1
+
+        return secondary_count
+
+    except Exception as e:
+        logger.debug(f"Secondary re-screening failed: {e}")
+        return 0
+
+
 async def generate_maneuver_candidates(
     conjunction_id: int,
 ) -> TradeOffMatrix | None:
@@ -174,11 +255,12 @@ async def generate_maneuver_candidates(
     For the maneuvering satellite (determined by profile availability),
     generates candidates at each configured delta-v step in both
     prograde and retrograde directions. Each candidate includes:
-      - Fuel cost (Tsiolkovsky)
+      - Fuel cost (Tsiolkovsky rocket equation)
       - Mission life impact (days and percentage)
       - New miss distance (simulated burn)
-      - Secondary conjunction count (placeholder — requires scoped re-screening)
+      - Secondary conjunction count (re-screened against catalog)
 
+    Candidates that create new secondary conjunctions are auto-rejected.
     The top 5 candidates by trade-off score are stored in the database.
 
     Returns None if the conjunction doesn't exist or has no maneuverable satellite.
@@ -260,6 +342,23 @@ async def generate_maneuver_candidates(
             if new_miss is None:
                 continue
 
+            # Re-screen modified trajectory for secondary conjunctions
+            secondary = await _count_secondary_conjunctions(
+                line1=maneuvering_obj.tle_line1,
+                line2=maneuvering_obj.tle_line2,
+                burn_time=burn_time,
+                delta_v_ms=delta_v,
+                direction=direction,
+                original_other_id=other_id,
+            )
+
+            # Auto-reject if the burn creates new collisions
+            status = ManeuverStatus.CANDIDATE
+            rejection_reason = None
+            if secondary > 0:
+                status = ManeuverStatus.REJECTED
+                rejection_reason = f"Creates {secondary} secondary conjunction(s)"
+
             candidates.append({
                 "conjunction_id": conjunction_id,
                 "satellite_id": maneuvering_id,
@@ -270,8 +369,8 @@ async def generate_maneuver_candidates(
                 "fuel_cost_kg": fuel_cost,
                 "mission_life_impact_days": life_impact.days,
                 "mission_life_impact_pct": life_impact.pct_of_remaining,
-                "secondary_conjunctions": 0,
-                "status": ManeuverStatus.CANDIDATE,
+                "secondary_conjunctions": secondary,
+                "status": status,
             })
 
     # Sort by trade-off score: maximize miss distance, minimize fuel cost

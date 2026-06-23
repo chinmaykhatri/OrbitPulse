@@ -37,7 +37,7 @@ from config import get_settings
 from db.session import AsyncSessionLocal
 from db.models import Conjunction
 from core.propagator import propagate_timeseries, teme_to_geodetic, PropagationError
-from core.risk_scoring import compute_risk_score, assign_tier
+from core.risk_scoring import compute_risk_score, assign_tier, assign_tier_with_reason
 from cache.position_cache import get_positions, set_pipeline_status
 
 logger = logging.getLogger("orbitpulse.core.detector")
@@ -326,10 +326,11 @@ async def run_detection(
             size_b=obj_b.get("rcs"),
             prev_miss_km=None,  # No historical data on first detection
         )
-        tier = assign_tier(score, conj["miss_km"], conj["rel_vel_kms"])
+        tier, reason = assign_tier_with_reason(score, conj["miss_km"], conj["rel_vel_kms"])
 
         conj["risk_score"] = score
         conj["tier"] = tier
+        conj["dismiss_reason"] = reason
 
     # Step 6: Upsert into database
     async with AsyncSessionLocal() as session:
@@ -342,6 +343,7 @@ async def run_detection(
                 "relative_velocity_kms": c["rel_vel_kms"],
                 "risk_score": c["risk_score"],
                 "tier": c["tier"],
+                "dismiss_reason": c.get("dismiss_reason"),
                 "both_maneuverable": False,  # Updated by profile cross-check later
             }
             for c in confirmed
@@ -355,6 +357,7 @@ async def run_detection(
                 "relative_velocity_kms": stmt.excluded.relative_velocity_kms,
                 "risk_score": stmt.excluded.risk_score,
                 "tier": stmt.excluded.tier,
+                "dismiss_reason": stmt.excluded.dismiss_reason,
                 "updated_at": text("NOW()"),
             },
         )

@@ -118,21 +118,63 @@ def assign_tier(
     Returns:
         TriageTier enum value (ACTION, WATCHLIST, or DISMISSED)
     """
+    tier, _ = assign_tier_with_reason(risk_score, miss_km, rel_vel_kms)
+    return tier
+
+
+def assign_tier_with_reason(
+    risk_score: float,
+    miss_km: float,
+    rel_vel_kms: float,
+) -> tuple[TriageTier, str]:
+    """Assign triage tier with a human-readable reason for the classification.
+
+    Returns:
+        Tuple of (TriageTier, reason_string).
+    """
     # Hard override: extremely close + fast = always ACTION
     if (
         miss_km < settings.action_distance_threshold_km
         and rel_vel_kms > settings.action_velocity_threshold_kms
     ):
-        return TriageTier.ACTION
+        return (
+            TriageTier.ACTION,
+            f"Hard override: miss {miss_km:.2f} km < {settings.action_distance_threshold_km} km "
+            f"AND velocity {rel_vel_kms:.1f} km/s > {settings.action_velocity_threshold_kms} km/s",
+        )
 
     # Standard threshold-based assignment
     if risk_score >= settings.action_risk_threshold:
-        return TriageTier.ACTION
+        return (
+            TriageTier.ACTION,
+            f"Risk score {risk_score:.2%} exceeds ACTION threshold ({settings.action_risk_threshold:.0%})",
+        )
 
     if (
         risk_score >= settings.watchlist_risk_threshold
         and miss_km < settings.watchlist_distance_threshold_km
     ):
-        return TriageTier.WATCHLIST
+        return (
+            TriageTier.WATCHLIST,
+            f"Risk {risk_score:.2%} ≥ {settings.watchlist_risk_threshold:.0%} "
+            f"AND miss {miss_km:.2f} km < {settings.watchlist_distance_threshold_km} km",
+        )
 
-    return TriageTier.DISMISSED
+    # Build dismissal reason
+    reasons: list[str] = []
+    if risk_score < settings.watchlist_risk_threshold:
+        reasons.append(
+            f"risk {risk_score:.2%} < WATCHLIST threshold ({settings.watchlist_risk_threshold:.0%})"
+        )
+    if miss_km >= settings.watchlist_distance_threshold_km:
+        reasons.append(
+            f"miss {miss_km:.2f} km ≥ distance threshold ({settings.watchlist_distance_threshold_km} km)"
+        )
+    if not reasons:
+        reasons.append("does not meet any escalation criteria")
+
+    return (
+        TriageTier.DISMISSED,
+        f"Dismissed: {'; '.join(reasons)}",
+    )
+
