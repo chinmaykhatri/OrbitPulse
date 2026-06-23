@@ -74,3 +74,47 @@ async def get_positions(
     """
     positions = await orbital_engine.get_current_positions_batch(limit=limit)
     return {"positions": positions, "count": len(positions)}
+
+
+@router.get("/sources")
+async def get_data_sources():
+    """Data source statistics — shows object counts per ingestion source.
+
+    Returns a breakdown of objects by data_source (celestrak, space-track)
+    with the most recent TLE epoch for each source. Useful for verifying
+    that the dual-source pipeline is working correctly.
+    """
+    from sqlalchemy import select, func
+    from db.session import AsyncSessionLocal
+    from db.models import SpaceObject
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(
+                SpaceObject.data_source,
+                func.count(SpaceObject.norad_id).label("count"),
+                func.max(SpaceObject.tle_epoch).label("latest_epoch"),
+                func.min(SpaceObject.tle_epoch).label("oldest_epoch"),
+            ).group_by(SpaceObject.data_source)
+        )
+        rows = result.all()
+
+    sources = []
+    total = 0
+    for row in rows:
+        count = row.count
+        total += count
+        sources.append({
+            "source": row.data_source,
+            "objects": count,
+            "latest_epoch": row.latest_epoch.isoformat() if row.latest_epoch else None,
+            "oldest_epoch": row.oldest_epoch.isoformat() if row.oldest_epoch else None,
+        })
+
+    return {
+        "sources": sources,
+        "total_objects": total,
+        "primary": "celestrak",
+        "supplemental": "space-track",
+        "note": "Space-Track.org requires a free account (SPACETRACK_USER/SPACETRACK_PASSWORD env vars). CelesTrak is always available without authentication.",
+    }

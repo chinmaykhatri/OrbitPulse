@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     claude_api_key: str = ""
     demo_secret_key: str = "orbitpulse-demo-2026"
     celestrak_base_url: str = "https://celestrak.org"
+    spacetrack_user: str = ""
+    spacetrack_password: str = ""
     cors_origins: str = "http://localhost:3000"
 
     # --- Pipeline Timing ---

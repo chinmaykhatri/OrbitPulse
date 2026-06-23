@@ -1,19 +1,24 @@
-"""Ingestion pipeline — fetches CelesTrak data and upserts into the database.
+"""Ingestion pipeline — fetches CelesTrak + Space-Track data and upserts into the database.
 
 This is the core data pipeline that runs:
   1. On startup (via main.py lifespan handler)
   2. Every 6 hours (via APScheduler, configured in config.ingestion_interval_hours)
 
 Pipeline stages:
-  1. Fetch GP catalog JSON from CelesTrak (preferred, includes metadata)
+  1. Fetch GP catalog JSON from CelesTrak (primary, includes metadata)
   2. If GP catalog fails, fall back to raw TLE text fetch + parse
   3. Upsert space objects into PostgreSQL (ON CONFLICT UPDATE)
-  4. Seed satellite profiles for key satellites (ISS, Starlink samples, etc.)
-  5. Report pipeline status via Redis for WebSocket broadcast
+  4. Optionally fetch supplemental data from Space-Track.org
+  5. Seed satellite profiles for key satellites (ISS, Starlink samples, etc.)
+  6. Report pipeline status via Redis for WebSocket broadcast
+
+Data source hierarchy:
+  - CelesTrak (primary): Free, no auth, ~25,000 active objects
+  - Space-Track.org (supplemental): Free account, ~50,000 objects, optional
 
 The pipeline is resilient: if CelesTrak is down, it logs the failure
-and returns 0 (no objects ingested). The server continues running with
-whatever data was previously in the database.
+and returns 0 (no objects ingested). Space-Track failures are non-fatal.
+The server continues running with whatever data was previously in the database.
 """
 import logging
 from datetime import datetime, timezone
@@ -171,6 +176,7 @@ async def _upsert_objects_from_gp(catalog: list[dict]) -> int:
                     continue
 
                 tle_line1 = entry.get("TLE_LINE1", "")
+                source = entry.get("_DATA_SOURCE", "celestrak")
                 values.append({
                     "norad_id": int(norad_id),
                     "name": entry.get("OBJECT_NAME", f"UNKNOWN-{norad_id}"),
@@ -182,6 +188,7 @@ async def _upsert_objects_from_gp(catalog: list[dict]) -> int:
                     "tle_line1": tle_line1,
                     "tle_line2": entry.get("TLE_LINE2", ""),
                     "tle_epoch": _parse_tle_epoch(tle_line1) if tle_line1 else None,
+                    "data_source": source,
                 })
 
             if not values:
@@ -200,6 +207,7 @@ async def _upsert_objects_from_gp(catalog: list[dict]) -> int:
                     "tle_line1": stmt.excluded.tle_line1,
                     "tle_line2": stmt.excluded.tle_line2,
                     "tle_epoch": stmt.excluded.tle_epoch,
+                    "data_source": stmt.excluded.data_source,
                     "updated_at": text("NOW()"),
                 },
             )
@@ -292,34 +300,85 @@ async def _seed_profiles() -> int:
         return seeded
 
 
+async def _try_spacetrack_supplemental(celestrak_count: int) -> int:
+    """Attempt to fetch supplemental objects from Space-Track.org.
+
+    Only runs if Space-Track credentials are configured. Adds objects
+    that aren't already in the database from CelesTrak.
+    Non-fatal — any error is logged and returns 0.
+
+    Args:
+        celestrak_count: Number of objects already ingested from CelesTrak.
+                         Used for progress reporting.
+
+    Returns:
+        Count of additional objects ingested from Space-Track.
+    """
+    settings = get_settings()
+    if not settings.spacetrack_user or not settings.spacetrack_password:
+        logger.debug("Space-Track credentials not configured — skipping supplemental ingestion")
+        return 0
+
+    try:
+        from ingestion.spacetrack_client import fetch_spacetrack_gp_catalog, SpaceTrackError
+
+        await set_pipeline_status("ingestion_spacetrack", 10.0)
+        logger.info("Fetching supplemental data from Space-Track.org...")
+
+        st_catalog = await fetch_spacetrack_gp_catalog(epoch_days=30)
+        if not st_catalog:
+            logger.info("Space-Track returned 0 objects — nothing to supplement")
+            return 0
+
+        await set_pipeline_status("ingestion_spacetrack", 50.0)
+        st_count = await _upsert_objects_from_gp(st_catalog)
+
+        await set_pipeline_status("ingestion_spacetrack", 100.0)
+        logger.info(
+            f"Space-Track supplemental ingestion: {st_count} objects "
+            f"(total catalog now: {celestrak_count + st_count})"
+        )
+        return st_count
+
+    except Exception as e:
+        logger.warning(f"Space-Track supplemental ingestion failed (non-fatal): {e}")
+        return 0
+
+
 async def run_ingestion() -> int:
     """Execute the full ingestion pipeline.
 
     Pipeline stages:
       1. Report status: 'ingestion' at 0%
-      2. Fetch GP catalog from CelesTrak (preferred)
+      2. Fetch GP catalog from CelesTrak (primary source)
       3. If GP fails, fall back to raw TLE text
       4. Upsert objects into database
-      5. Seed operator profiles for key satellites
-      6. Report status: 'ingestion' at 100%
+      5. Optionally fetch supplemental data from Space-Track.org
+      6. Seed operator profiles for key satellites
+      7. Report status: 'ingestion' at 100%
+
+    Data source hierarchy:
+      - CelesTrak: Always tried first (free, no auth, ~25k active objects)
+      - Space-Track: Tried second if credentials are configured (~50k objects)
 
     Returns:
-        Count of objects ingested (0 if CelesTrak is unreachable
-        and no fallback data is available).
+        Total count of objects ingested from all sources (0 if all
+        sources are unreachable and no fallback data is available).
     """
     await set_pipeline_status("ingestion", 0.0)
     logger.info("Starting ingestion pipeline...")
 
     count = 0
 
-    # Strategy 1: GP catalog JSON (preferred — includes metadata)
+    # Source 1: CelesTrak GP catalog JSON (primary — free, no auth)
     try:
         catalog = await fetch_gp_catalog()
         count = await _upsert_objects_from_gp(catalog)
+        logger.info(f"CelesTrak primary ingestion: {count} objects")
     except CelesTrakError as e:
         logger.warning(f"GP catalog fetch failed: {e} — trying TLE text fallback")
 
-        # Strategy 2: Raw TLE text (fallback — no metadata)
+        # Fallback: Raw TLE text (no metadata)
         try:
             tle_text = await fetch_tle_data("active")
             count = await _upsert_objects_from_tle(tle_text)
@@ -330,6 +389,10 @@ async def run_ingestion() -> int:
                 f"Pipeline will use existing database data."
             )
 
+    # Source 2: Space-Track.org (supplemental — optional, needs free account)
+    st_count = await _try_spacetrack_supplemental(count)
+    total_count = count + st_count
+
     # Seed profiles regardless of fetch success — they reference existing objects
     try:
         await _seed_profiles()
@@ -337,5 +400,8 @@ async def run_ingestion() -> int:
         logger.error(f"Profile seeding failed: {e}", exc_info=True)
 
     await set_pipeline_status("ingestion", 100.0)
-    logger.info(f"Ingestion pipeline complete: {count} objects")
-    return count
+    logger.info(
+        f"Ingestion pipeline complete: {total_count} objects "
+        f"(CelesTrak: {count}, Space-Track: {st_count})"
+    )
+    return total_count

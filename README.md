@@ -4,7 +4,7 @@
 
 Real orbital data. Real physics. Real collision predictions.
 
-OrbitPulse ingests the full CelesTrak catalog (~25,000 tracked objects), propagates orbits with SGP4 over a 72-hour window, detects conjunctions using two-pass screening, scores risk, plans avoidance maneuvers, runs game-theoretic negotiation between operators, and simulates fragmentation events — all in a single application.
+OrbitPulse ingests the full CelesTrak catalog (~25,000 tracked objects) with optional Space-Track.org supplemental data (~50,000 objects), propagates orbits with SGP4 over a 72-hour window, detects conjunctions using two-pass screening, scores risk, plans avoidance maneuvers, runs game-theoretic negotiation between operators, and simulates fragmentation events — all in a single application.
 
 ---
 
@@ -16,10 +16,10 @@ OrbitPulse ingests the full CelesTrak catalog (~25,000 tracked objects), propaga
 │  (TLE/GP)    │    │   Pipeline    │    │  (6 tables)  │
 └──────────────┘    └───────┬───────┘    └──────┬──────┘
                             │                    │
-                    ┌───────▼───────┐    ┌───────▼──────┐
-                    │  SGP4 Engine  │───▶│    Redis      │
-                    │  (NumPy vec)  │    │ (pos arrays)  │
-                    └───────┬───────┘    └──────┬───────┘
+┌──────────────┐    ┌───────▼───────┐    ┌───────▼──────┐
+│ Space-Track  │───▶│  SGP4 Engine  │───▶│    Redis      │
+│ (optional)   │    │  (NumPy vec)  │    │ (pos arrays)  │
+└──────────────┘    └───────┬───────┘    └──────┬───────┘
                             │                    │
                     ┌───────▼───────┐            │
                     │  2-Pass       │◀───────────┘
@@ -132,8 +132,10 @@ npm run dev
 |----------|---------|-------------|
 | `DATABASE_URL` | `postgresql+asyncpg://...localhost/orbitpulse` | Async PostgreSQL connection |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis for position cache |
-| `CLAUDE_API_KEY` | (empty) | Anthropic API key for AI explanations |
+| `CLAUDE_API_KEY` | (empty) | Anthropic API key for AI explanations (optional) |
 | `DEMO_SECRET_KEY` | `orbitpulse-demo-2026` | X-Demo-Key header value |
+| `SPACETRACK_USER` | (empty) | Space-Track.org username (optional, free account) |
+| `SPACETRACK_PASSWORD` | (empty) | Space-Track.org password (optional) |
 | `CORS_ORIGINS` | `http://localhost:3000` | Allowed CORS origins |
 | `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Backend API URL |
 | `NEXT_PUBLIC_WS_URL` | `ws://localhost:8000` | WebSocket URL |
@@ -156,6 +158,7 @@ npm run dev
 | POST | `/api/simulate/fragment/{norad_id}` | Trigger fragmentation simulation |
 | GET | `/api/socrates` | SOCRATES cross-validation |
 | GET | `/api/pipeline/status` | Detailed pipeline stage info |
+| GET | `/api/sources` | Data source statistics (CelesTrak vs Space-Track) |
 | WS | `/ws/live` | Real-time positions + alerts |
 
 ---
@@ -190,7 +193,7 @@ orbitpulse2/
 │   │   ├── negotiation.py    # Game-theoretic protocol
 │   │   ├── fragmentation.py  # NASA breakup model
 │   │   └── socrates.py       # SOCRATES validation
-│   ├── ingestion/        # CelesTrak data pipeline
+│   ├── ingestion/        # Dual-source data pipeline (CelesTrak + Space-Track)
 │   ├── db/               # SQLAlchemy models + session
 │   ├── cache/            # Redis position cache
 │   ├── schemas/          # Pydantic request/response models

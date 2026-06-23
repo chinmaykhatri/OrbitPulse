@@ -84,6 +84,7 @@ class SpaceObject(Base):
     tle_line1 = Column(Text, nullable=True)
     tle_line2 = Column(Text, nullable=True)
     tle_epoch = Column(DateTime, nullable=True)
+    data_source = Column(String(20), nullable=False, default="celestrak", server_default="celestrak")
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
 
     # Relationships

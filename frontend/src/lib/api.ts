@@ -72,3 +72,18 @@ export const getPipelineStatus = () =>
   fetchJSON<{ pipeline: { stage: string; progress_pct: number } | null; catalog_size: number; is_propagated: boolean }>(
     '/api/pipeline/status'
   );
+
+// Data Sources
+export interface DataSourceInfo {
+  source: string;
+  objects: number;
+  latest_epoch: string | null;
+  oldest_epoch: string | null;
+}
+export const getDataSources = () =>
+  fetchJSON<{
+    sources: DataSourceInfo[];
+    total_objects: number;
+    primary: string;
+    supplemental: string;
+  }>('/api/sources');
