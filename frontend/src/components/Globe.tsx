@@ -17,7 +17,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import type { ISSPosition } from '@/types/api';
 
 interface GlobeProps {
-  positions: number[][]; // [norad_id, x_km, y_km, z_km] from WebSocket
+  positions: number[][]; // [norad_id, lat, lon, alt_km] from WebSocket
   issPosition: ISSPosition | null;
   onSatelliteClick?: (noradId: number) => void;
 }
@@ -25,14 +25,6 @@ interface GlobeProps {
 const EARTH_RADIUS = 6371; // km
 const TWO_PI = Math.PI * 2;
 const DEG2RAD = Math.PI / 180;
-
-function temeToLatLon(x: number, y: number, z: number): [number, number, number] {
-  const r = Math.sqrt(x * x + y * y + z * z);
-  const lat = Math.asin(z / r) / DEG2RAD;
-  const lon = Math.atan2(y, x) / DEG2RAD;
-  const alt = r - EARTH_RADIUS;
-  return [lat, lon, alt];
-}
 
 export default function Globe({ positions, issPosition, onSatelliteClick }: GlobeProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -173,8 +165,7 @@ export default function Globe({ positions, issPosition, onSatelliteClick }: Glob
       const satScale = globeR / EARTH_RADIUS;
       for (const pos of positions) {
         if (pos.length < 4) continue;
-        const [, x, y, z] = pos;
-        const [lat, lon, alt] = temeToLatLon(x, y, z);
+        const [, lat, lon, alt] = pos;
 
         const orbitR = (EARTH_RADIUS + alt) * satScale;
         const pt = projectPoint(lat * DEG2RAD, lon * DEG2RAD, orbitR, cx, cy, rotX, rotY);
